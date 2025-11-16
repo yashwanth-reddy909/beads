@@ -13,6 +13,7 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/cmd/bd/doctor"
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
@@ -149,7 +150,7 @@ With --no-db: creates .beads/ directory and issues.jsonl file instead of SQLite 
 			}
 
 			// Create metadata.json for --no-db mode
-			cfg := configfile.DefaultConfig(Version)
+			cfg := configfile.DefaultConfig()
 			if err := cfg.Save(localBeadsDir); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to create metadata.json: %v\n", err)
 				// Non-fatal - continue anyway
@@ -175,34 +176,13 @@ With --no-db: creates .beads/ directory and issues.jsonl file instead of SQLite 
 			return
 		}
 
-		// Create .gitignore in .beads directory
+		// Create/update .gitignore in .beads directory (idempotent - always update to latest)
 		gitignorePath := filepath.Join(localBeadsDir, ".gitignore")
-		gitignoreContent := `# SQLite databases
-*.db
-*.db-journal
-*.db-wal
-*.db-shm
-
-# Daemon runtime files
-daemon.lock
-daemon.log
-daemon.pid
-bd.sock
-
-# Legacy database files
-db.sqlite
-bd.db
-
-# Keep JSONL exports and config (source of truth for git)
-!*.jsonl
-!metadata.json
-!config.json
-`
-			if err := os.WriteFile(gitignorePath, []byte(gitignoreContent), 0600); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to create .gitignore: %v\n", err)
-				// Non-fatal - continue anyway
-			}
+		if err := os.WriteFile(gitignorePath, []byte(doctor.GitignoreTemplate), 0600); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to create/update .gitignore: %v\n", err)
+			// Non-fatal - continue anyway
 		}
+	}
 	
 		// Ensure parent directory exists for the database
 		if err := os.MkdirAll(initDBDir, 0750); err != nil {
@@ -272,7 +252,7 @@ bd.db
 
 	// Create metadata.json for database metadata
 	if useLocalBeads {
-		cfg := configfile.DefaultConfig(Version)
+		cfg := configfile.DefaultConfig()
 		if err := cfg.Save(localBeadsDir); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to create metadata.json: %v\n", err)
 			// Non-fatal - continue anyway
@@ -715,7 +695,7 @@ fi
 # Import the updated JSONL
 if ! bd import -i .beads/issues.jsonl >/dev/null 2>&1; then
     echo "Warning: Failed to import bd changes after merge" >&2
-    echo "Run 'bd import -i .beads/issues.jsonl' manually" >&2
+    echo "Run 'bd import -i .beads/issues.jsonl' manually to see the error" >&2
 fi
 
 exit 0
@@ -750,7 +730,7 @@ fi
 # to ensure immediate sync after merge
 if ! bd import -i .beads/issues.jsonl >/dev/null 2>&1; then
     echo "Warning: Failed to import bd changes after merge" >&2
-    echo "Run 'bd import -i .beads/issues.jsonl' manually" >&2
+    echo "Run 'bd import -i .beads/issues.jsonl' manually to see the error" >&2
     # Don't fail the merge, just warn
 fi
 

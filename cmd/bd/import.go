@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/debug"
@@ -95,15 +97,20 @@ NOTE: Import requires direct database access and does not work with daemon mode.
 
 		for scanner.Scan() {
 		lineNum++
-		line := scanner.Text()
+		rawLine := scanner.Bytes()
+		line := string(rawLine)
 
 		// Skip empty lines
 		if line == "" {
 		continue
 		}
 
-		// Detect git conflict markers and attempt automatic 3-way merge
-		if strings.Contains(line, "<<<<<<<") || strings.Contains(line, "=======") || strings.Contains(line, ">>>>>>>") {
+		// Detect git conflict markers in raw bytes (before JSON decoding)
+		// This prevents false positives when issue content contains these strings
+		trimmed := bytes.TrimSpace(rawLine)
+		if bytes.HasPrefix(trimmed, []byte("<<<<<<< ")) || 
+			bytes.Equal(trimmed, []byte("=======")) || 
+			bytes.HasPrefix(trimmed, []byte(">>>>>>> ")) {
 			fmt.Fprintf(os.Stderr, "Git conflict markers detected in JSONL file (line %d)\n", lineNum)
 			fmt.Fprintf(os.Stderr, "→ Attempting automatic 3-way merge...\n\n")
 
@@ -301,6 +308,16 @@ NOTE: Import requires direct database access and does not work with daemon mode.
 			flushToJSONL()
 		}
 
+		// Update database mtime to reflect it's now in sync with JSONL
+		// This is CRITICAL even when import found 0 changes, because:
+		// 1. Import validates DB and JSONL are in sync (no content divergence)
+		// 2. Without mtime update, bd sync refuses to export (thinks JSONL is newer)
+		// 3. This can happen after git pull updates JSONL mtime but content is identical
+		// Fix for: refusing to export: JSONL is newer than database (import first to avoid data loss)
+		if err := touchDatabaseFile(dbPath, input); err != nil {
+			debug.Logf("Warning: failed to update database mtime: %v", err)
+		}
+
 		// Print summary
 		fmt.Fprintf(os.Stderr, "Import complete: %d created, %d updated", result.Created, result.Updated)
 		if result.Unchanged > 0 {
@@ -362,6 +379,33 @@ NOTE: Import requires direct database access and does not work with daemon mode.
 			fmt.Fprintf(os.Stderr, "Run 'bd duplicates --auto-merge' to merge all duplicates.\n")
 		}
 	},
+}
+
+// touchDatabaseFile updates the modification time of the database file.
+// This is used after import to ensure the database appears "in sync" with JSONL,
+// preventing bd doctor from incorrectly warning that JSONL is newer.
+//
+// In SQLite WAL mode, writes go to beads.db-wal and beads.db mtime may not update
+// until a checkpoint. Since bd doctor compares JSONL mtime to beads.db mtime only,
+// we need to explicitly touch the DB file after import.
+//
+// The function sets DB mtime to max(JSONL mtime, now) + 1ns to handle clock skew.
+// If jsonlPath is empty or can't be read, falls back to time.Now().
+func touchDatabaseFile(dbPath, jsonlPath string) error {
+	targetTime := time.Now()
+	
+	// If we have the JSONL path, use max(JSONL mtime, now) to handle clock skew
+	if jsonlPath != "" {
+		if info, err := os.Stat(jsonlPath); err == nil {
+			jsonlTime := info.ModTime()
+			if jsonlTime.After(targetTime) {
+				targetTime = jsonlTime.Add(time.Nanosecond)
+			}
+		}
+	}
+	
+	// Best-effort touch - don't fail import if this doesn't work
+	return os.Chtimes(dbPath, targetTime, targetTime)
 }
 
 // checkUncommittedChanges detects if the JSONL file has uncommitted changes
@@ -501,7 +545,7 @@ func attemptAutoMerge(conflictedPath string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create temp directory: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	basePath := filepath.Join(tmpDir, "base.jsonl")
 	leftPath := filepath.Join(tmpDir, "left.jsonl")
@@ -585,6 +629,7 @@ func attemptAutoMerge(conflictedPath string) error {
 }
 
 // detectPrefixFromIssues extracts the common prefix from issue IDs
+// Only considers the first hyphen, so "vc-baseline-test" -> "vc"
 func detectPrefixFromIssues(issues []*types.Issue) string {
 	if len(issues) == 0 {
 		return ""
@@ -593,10 +638,10 @@ func detectPrefixFromIssues(issues []*types.Issue) string {
 	// Count prefix occurrences
 	prefixCounts := make(map[string]int)
 	for _, issue := range issues {
-		// Extract prefix from issue ID (e.g., "bd-123" -> "bd")
-		parts := strings.SplitN(issue.ID, "-", 2)
-		if len(parts) == 2 {
-			prefixCounts[parts[0]]++
+		// Extract prefix from issue ID using first hyphen only
+		idx := strings.Index(issue.ID, "-")
+		if idx > 0 {
+			prefixCounts[issue.ID[:idx]]++
 		}
 	}
 	

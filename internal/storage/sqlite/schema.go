@@ -30,7 +30,7 @@ CREATE INDEX IF NOT EXISTS idx_issues_status ON issues(status);
 CREATE INDEX IF NOT EXISTS idx_issues_priority ON issues(priority);
 CREATE INDEX IF NOT EXISTS idx_issues_assignee ON issues(assignee);
 CREATE INDEX IF NOT EXISTS idx_issues_created_at ON issues(created_at);
-CREATE INDEX IF NOT EXISTS idx_issues_external_ref ON issues(external_ref);
+-- Note: idx_issues_external_ref is created in migrations/002_external_ref_column.go
 
 -- Dependencies table
 CREATE TABLE IF NOT EXISTS dependencies (
@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS dependencies (
 CREATE INDEX IF NOT EXISTS idx_dependencies_issue ON dependencies(issue_id);
 CREATE INDEX IF NOT EXISTS idx_dependencies_depends_on ON dependencies(depends_on_id);
 CREATE INDEX IF NOT EXISTS idx_dependencies_depends_on_type ON dependencies(depends_on_id, type);
+CREATE INDEX IF NOT EXISTS idx_dependencies_depends_on_type_issue ON dependencies(depends_on_id, type, issue_id);
 
 -- Labels table
 CREATE TABLE IF NOT EXISTS labels (

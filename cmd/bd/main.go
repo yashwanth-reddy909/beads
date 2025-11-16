@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
+	"runtime/trace"
 	"slices"
 	"sync"
 	"time"
@@ -78,6 +80,9 @@ var (
 	noAutoImport bool
 	sandboxMode  bool
 	noDb         bool // Use --no-db mode: load from JSONL, write back after each command
+	profileEnabled bool
+	profileFile    *os.File
+	traceFile      *os.File
 )
 
 func init() {
@@ -95,6 +100,7 @@ func init() {
 	rootCmd.PersistentFlags().BoolVar(&noAutoImport, "no-auto-import", false, "Disable automatic JSONL import when newer than DB")
 	rootCmd.PersistentFlags().BoolVar(&sandboxMode, "sandbox", false, "Sandbox mode: disables daemon and auto-sync")
 	rootCmd.PersistentFlags().BoolVar(&noDb, "no-db", false, "Use no-db mode: load from JSONL, no SQLite")
+	rootCmd.PersistentFlags().BoolVar(&profileEnabled, "profile", false, "Generate CPU profile for performance analysis")
 
 	// Add --version flag to root command (same behavior as version subcommand)
 	rootCmd.Flags().BoolP("version", "v", false, "Print version information")
@@ -141,8 +147,40 @@ var rootCmd = &cobra.Command{
 			actor = config.GetString("actor")
 		}
 
+		// Performance profiling setup
+		// When --profile is enabled, force direct mode to capture actual database operations
+		// rather than just RPC serialization/network overhead. This gives accurate profiles
+		// of the storage layer, query performance, and business logic.
+		if profileEnabled {
+			noDaemon = true
+			timestamp := time.Now().Format("20060102-150405")
+			if f, _ := os.Create(fmt.Sprintf("bd-profile-%s-%s.prof", cmd.Name(), timestamp)); f != nil {
+				profileFile = f
+				_ = pprof.StartCPUProfile(f)
+			}
+			if f, _ := os.Create(fmt.Sprintf("bd-trace-%s-%s.out", cmd.Name(), timestamp)); f != nil {
+				traceFile = f
+				_ = trace.Start(f)
+			}
+		}
+
 		// Skip database initialization for commands that don't need a database
-		noDbCommands := []string{"init", cmdDaemon, "help", "version", "quickstart", "doctor", "merge", "completion", "bash", "zsh", "fish", "powershell"}
+		noDbCommands := []string{
+			cmdDaemon,
+			"bash",
+			"completion",
+			"doctor",
+			"fish",
+			"help",
+			"init",
+			"merge",
+			"powershell",
+			"prime",
+			"quickstart",
+			"setup",
+			"version",
+			"zsh",
+		}
 		if slices.Contains(noDbCommands, cmd.Name()) {
 			return
 		}
@@ -410,9 +448,6 @@ var rootCmd = &cobra.Command{
 		// Warn if multiple databases detected in directory hierarchy
 		warnMultipleDatabases(dbPath)
 
-		// Check for version mismatch (warn if binary is older than DB)
-		checkVersionMismatch()
-
 		// Auto-import if JSONL is newer than DB (e.g., after git pull)
 		// Skip for import command itself to avoid recursion
 		// Skip for delete command to prevent resurrection of deleted issues (bd-8kde)
@@ -493,6 +528,8 @@ var rootCmd = &cobra.Command{
 		if store != nil {
 			_ = store.Close()
 		}
+		if profileFile != nil { pprof.StopCPUProfile(); _ = profileFile.Close() }
+		if traceFile != nil { trace.Stop(); _ = traceFile.Close() }
 	},
 }
 

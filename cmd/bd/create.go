@@ -229,6 +229,7 @@ var createCmd = &cobra.Command{
 				Design:             design,
 				AcceptanceCriteria: acceptance,
 				Assignee:           assignee,
+				ExternalRef:        externalRef,
 				Labels:             labels,
 				Dependencies:       deps,
 			}
@@ -310,6 +311,18 @@ var createCmd = &cobra.Command{
 		if err := store.CreateIssue(ctx, issue, actor); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
+		}
+
+		// If parent was specified, add parent-child dependency
+		if parentID != "" {
+			dep := &types.Dependency{
+				IssueID:     issue.ID,
+				DependsOnID: parentID,
+				Type:        types.DepParentChild,
+			}
+			if err := store.AddDependency(ctx, dep, actor); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to add parent-child dependency %s -> %s: %v\n", issue.ID, parentID, err)
+			}
 		}
 
 		// Add labels if specified

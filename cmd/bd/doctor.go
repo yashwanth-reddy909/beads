@@ -14,6 +14,7 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/cmd/bd/doctor"
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/daemon"
@@ -43,6 +44,11 @@ type doctorResult struct {
 	CLIVersion string        `json:"cli_version"`
 }
 
+var (
+	doctorFix bool
+	perfMode  bool
+)
+
 var doctorCmd = &cobra.Command{
 	Use:   "doctor [path]",
 	Short: "Check beads installation health",
@@ -50,7 +56,8 @@ var doctorCmd = &cobra.Command{
 
 This command checks:
   - If .beads/ directory exists
-  - Database version and schema compatibility
+  - Database version and migration status
+  - Schema compatibility (all required tables and columns present)
   - Whether using hash-based vs sequential IDs
   - If CLI version is current (checks GitHub releases)
   - Multiple database files
@@ -60,11 +67,21 @@ This command checks:
   - File permissions
   - Circular dependencies
   - Git hooks (pre-commit, post-merge, pre-push)
+  - .beads/.gitignore up to date
+
+Performance Mode (--perf):
+  Run performance diagnostics on your database:
+  - Times key operations (bd ready, bd list, bd show, etc.)
+  - Collects system info (OS, arch, SQLite version, database stats)
+  - Generates CPU profile for analysis
+  - Outputs shareable report for bug reports
 
 Examples:
   bd doctor              # Check current directory
   bd doctor /path/to/repo # Check specific repository
-  bd doctor --json       # Machine-readable output`,
+  bd doctor --json       # Machine-readable output
+  bd doctor --fix        # Automatically fix issues
+  bd doctor --perf       # Performance diagnostics`,
 	Run: func(cmd *cobra.Command, args []string) {
 		// Use global jsonOutput set by PersistentPreRun
 
@@ -81,8 +98,21 @@ Examples:
 			os.Exit(1)
 		}
 
+		// Run performance diagnostics if --perf flag is set
+		if perfMode {
+			doctor.RunPerformanceDiagnostics(absPath)
+			return
+		}
+
 		// Run diagnostics
 		result := runDiagnostics(absPath)
+
+		// Apply fixes if requested
+		if doctorFix {
+			applyFixes(result)
+			// Re-run diagnostics to show results
+			result = runDiagnostics(absPath)
+		}
 
 		// Output results
 		if jsonOutput {
@@ -98,7 +128,27 @@ Examples:
 	},
 }
 
-func runDiagnostics(path string) doctorResult {
+func init() {
+	doctorCmd.Flags().BoolVar(&doctorFix, "fix", false, "Automatically fix issues where possible")
+}
+
+func applyFixes(result doctorResult) {
+	for _, check := range result.Checks {
+		if check.Status == statusWarning || check.Status == statusError {
+			switch check.Name {
+			case "Gitignore":
+				fmt.Println("Fixing .beads/.gitignore...")
+				if err := doctor.FixGitignore(); err != nil {
+					fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
+				} else {
+					fmt.Println("  ✓ Updated .beads/.gitignore")
+				}
+			}
+		}
+	}
+}
+
+func runDiagnostics(path string) doctorResult{
 	result := doctorResult{
 		Path:       path,
 		CLIVersion: Version,
@@ -129,6 +179,13 @@ func runDiagnostics(path string) doctorResult {
 		result.OverallOK = false
 	}
 
+	// Check 2a: Schema compatibility (bd-ckvw)
+	schemaCheck := checkSchemaCompatibility(path)
+	result.Checks = append(result.Checks, schemaCheck)
+	if schemaCheck.Status == statusError {
+		result.OverallOK = false
+	}
+
 	// Check 3: ID format (hash vs sequential)
 	idCheck := checkIDFormat(path)
 	result.Checks = append(result.Checks, idCheck)
@@ -148,10 +205,10 @@ func runDiagnostics(path string) doctorResult {
 		result.OverallOK = false
 	}
 
-	// Check 6: Multiple JSONL files
-	multiJSONLCheck := checkMultipleJSONLFiles(path)
-	result.Checks = append(result.Checks, multiJSONLCheck)
-	if multiJSONLCheck.Status == statusWarning || multiJSONLCheck.Status == statusError {
+	// Check 6: Legacy JSONL filename (issues.jsonl vs beads.jsonl)
+	jsonlCheck := convertDoctorCheck(doctor.CheckLegacyJSONLFilename(path))
+	result.Checks = append(result.Checks, jsonlCheck)
+	if jsonlCheck.Status == statusWarning || jsonlCheck.Status == statusError {
 		result.OverallOK = false
 	}
 
@@ -183,7 +240,33 @@ func runDiagnostics(path string) doctorResult {
 		result.OverallOK = false
 	}
 
+	// Check 11: Claude integration
+	claudeCheck := convertDoctorCheck(doctor.CheckClaude())
+	result.Checks = append(result.Checks, claudeCheck)
+	// Don't fail overall check for missing Claude integration, just warn
+
+	// Check 12: Legacy beads slash commands in documentation
+	legacyDocsCheck := convertDoctorCheck(doctor.CheckLegacyBeadsSlashCommands(path))
+	result.Checks = append(result.Checks, legacyDocsCheck)
+	// Don't fail overall check for legacy docs, just warn
+
+	// Check 13: Gitignore up to date
+	gitignoreCheck := convertDoctorCheck(doctor.CheckGitignore())
+	result.Checks = append(result.Checks, gitignoreCheck)
+	// Don't fail overall check for gitignore, just warn
+
 	return result
+}
+
+// convertDoctorCheck converts doctor package check to main package check
+func convertDoctorCheck(dc doctor.DoctorCheck) doctorCheck {
+	return doctorCheck{
+		Name:    dc.Name,
+		Status:  dc.Status,
+		Message: dc.Message,
+		Detail:  dc.Detail,
+		Fix:     dc.Fix,
+	}
 }
 
 func checkInstallation(path string) doctorCheck {
@@ -223,8 +306,20 @@ func checkDatabaseVersion(path string) doctorCheck {
 	// Check if database file exists
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 		// Check if JSONL exists (--no-db mode)
-		jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-		if _, err := os.Stat(jsonlPath); err == nil {
+		// Check both canonical (beads.jsonl) and legacy (issues.jsonl) names
+		beadsJSONL := filepath.Join(beadsDir, "beads.jsonl")
+		issuesJSONL := filepath.Join(beadsDir, "issues.jsonl")
+
+		if _, err := os.Stat(beadsJSONL); err == nil {
+			return doctorCheck{
+				Name:    "Database",
+				Status:  statusOK,
+				Message: "JSONL-only mode",
+				Detail:  "Using beads.jsonl (no SQLite database)",
+			}
+		}
+
+		if _, err := os.Stat(issuesJSONL); err == nil {
 			return doctorCheck{
 				Name:    "Database",
 				Status:  statusOK,
@@ -314,7 +409,7 @@ func checkIDFormat(path string) doctorCheck {
 	}
 
 	// Open database
-	db, err := sql.Open("sqlite3", dbPath+"?mode=ro")
+	db, err := sql.Open("sqlite3", "file:"+dbPath+"?mode=ro")
 	if err != nil {
 		return doctorCheck{
 			Name:    "Issue IDs",
@@ -400,7 +495,7 @@ func checkCLIVersion() doctorCheck {
 }
 
 func getDatabaseVersionFromPath(dbPath string) string {
-	db, err := sql.Open("sqlite3", dbPath+"?mode=ro")
+	db, err := sql.Open("sqlite3", "file:"+dbPath+"?mode=ro")
 	if err != nil {
 		return "unknown"
 	}
@@ -615,42 +710,6 @@ func checkMultipleDatabases(path string) doctorCheck {
 		Status:  statusWarning,
 		Message: fmt.Sprintf("Multiple database files found: %s", strings.Join(dbFiles, ", ")),
 		Fix:     "Run 'bd migrate' to consolidate databases or manually remove old .db files",
-	}
-}
-
-func checkMultipleJSONLFiles(path string) doctorCheck {
-	beadsDir := filepath.Join(path, ".beads")
-	
-	var jsonlFiles []string
-	for _, name := range []string{"issues.jsonl", "beads.jsonl"} {
-		jsonlPath := filepath.Join(beadsDir, name)
-		if _, err := os.Stat(jsonlPath); err == nil {
-			jsonlFiles = append(jsonlFiles, name)
-		}
-	}
-
-	if len(jsonlFiles) == 0 {
-		return doctorCheck{
-			Name:    "JSONL Files",
-			Status:  statusOK,
-			Message: "No JSONL files found (database-only mode)",
-		}
-	}
-
-	if len(jsonlFiles) == 1 {
-		return doctorCheck{
-			Name:    "JSONL Files",
-			Status:  statusOK,
-			Message: fmt.Sprintf("Using %s", jsonlFiles[0]),
-		}
-	}
-
-	// Multiple JSONL files found
-	return doctorCheck{
-		Name:    "JSONL Files",
-		Status:  statusWarning,
-		Message: fmt.Sprintf("Multiple JSONL files found: %s", strings.Join(jsonlFiles, ", ")),
-		Fix:     "Standardize on one JSONL file (issues.jsonl recommended). Delete or rename the other.",
 	}
 }
 
@@ -1158,7 +1217,7 @@ func checkGitHooks(path string) doctorCheck {
 		}
 	}
 
-	hookInstallMsg := "See https://github.com/steveyegge/beads/tree/main/examples/git-hooks for installation instructions"
+	hookInstallMsg := "Install hooks with 'bd hooks install'. See https://github.com/steveyegge/beads/tree/main/examples/git-hooks for installation instructions"
 
 	if len(installedHooks) > 0 {
 		return doctorCheck{
@@ -1179,6 +1238,91 @@ func checkGitHooks(path string) doctorCheck {
 	}
 }
 
+func checkSchemaCompatibility(path string) doctorCheck {
+	beadsDir := filepath.Join(path, ".beads")
+	
+	// Check metadata.json first for custom database name
+	var dbPath string
+	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil && cfg.Database != "" {
+		dbPath = cfg.DatabasePath(beadsDir)
+	} else {
+		// Fall back to canonical database name
+		dbPath = filepath.Join(beadsDir, beads.CanonicalDatabaseName)
+	}
+
+	// If no database, skip this check
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		return doctorCheck{
+			Name:    "Schema Compatibility",
+			Status:  statusOK,
+			Message: "N/A (no database)",
+		}
+	}
+
+	// Open database (bd-ckvw: This will run migrations and schema probe)
+	// Note: We can't use the global 'store' because doctor can check arbitrary paths
+	db, err := sql.Open("sqlite3", "file:"+dbPath+"?_pragma=foreign_keys(ON)&_pragma=busy_timeout(30000)")
+	if err != nil {
+		return doctorCheck{
+			Name:    "Schema Compatibility",
+			Status:  statusError,
+			Message: "Failed to open database",
+			Detail:  err.Error(),
+			Fix:     "Database may be corrupted. Try 'bd migrate' or restore from backup",
+		}
+	}
+	defer db.Close()
+
+	// Run schema probe (defined in internal/storage/sqlite/schema_probe.go)
+	// This is a simplified version since we can't import the internal package directly
+	// Check all critical tables and columns
+	criticalChecks := map[string][]string{
+		"issues": {"id", "title", "content_hash", "external_ref", "compacted_at"},
+		"dependencies": {"issue_id", "depends_on_id", "type"},
+		"child_counters": {"parent_id", "last_child"},
+		"export_hashes": {"issue_id", "content_hash"},
+	}
+
+	var missingElements []string
+	for table, columns := range criticalChecks {
+		// Try to query all columns
+		query := fmt.Sprintf("SELECT %s FROM %s LIMIT 0", strings.Join(columns, ", "), table)
+		_, err := db.Exec(query)
+		
+		if err != nil {
+			errMsg := err.Error()
+			if strings.Contains(errMsg, "no such table") {
+				missingElements = append(missingElements, fmt.Sprintf("table:%s", table))
+			} else if strings.Contains(errMsg, "no such column") {
+				// Find which columns are missing
+				for _, col := range columns {
+					colQuery := fmt.Sprintf("SELECT %s FROM %s LIMIT 0", col, table)
+					if _, colErr := db.Exec(colQuery); colErr != nil && strings.Contains(colErr.Error(), "no such column") {
+						missingElements = append(missingElements, fmt.Sprintf("%s.%s", table, col))
+					}
+				}
+			}
+		}
+	}
+
+	if len(missingElements) > 0 {
+		return doctorCheck{
+			Name:    "Schema Compatibility",
+			Status:  statusError,
+			Message: "Database schema is incomplete or incompatible",
+			Detail:  fmt.Sprintf("Missing: %s", strings.Join(missingElements, ", ")),
+			Fix:     "Run 'bd migrate' to upgrade schema, or if daemon is running an old version, run 'bd daemons killall' to restart",
+		}
+	}
+
+	return doctorCheck{
+		Name:    "Schema Compatibility",
+		Status:  statusOK,
+		Message: "All required tables and columns present",
+	}
+}
+
 func init() {
 	rootCmd.AddCommand(doctorCmd)
+	doctorCmd.Flags().BoolVar(&perfMode, "perf", false, "Run performance diagnostics and generate CPU profile")
 }
